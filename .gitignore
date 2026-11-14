@@ -1,0 +1,19 @@
+# Local user secrets & personal configs
+config.json
+auto-apikey.txt
+
+# Runtime data & generated binaries
+artifacts/
+downloads/
+dist/
+node/
+node_modules/
+bin/
+*.exe
+*.zip
+*.log
+*.tmp
+
+# OS metadata
+.DS_Store
+Thumbs.db

@@ -1,0 +1,31 @@
+{
+  "name": "overleaf-mcp-kit",
+  "version": "1.1.0",
+  "description": "Enhanced Overleaf MCP server & gateway with upload, download, delete, and PDF compile preview",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node launcher.mjs",
+    "mcp": "node server/index.js",
+    "build:exe": "node packaging/build-release.mjs",
+    "test": "node tests/run-tests.mjs"
+  },
+  "keywords": [
+    "overleaf",
+    "mcp",
+    "latex",
+    "track-changes",
+    "cloudflare-tunnel",
+    "ai-agent"
+  ],
+  "author": "Nieyin345",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Nieyin345/overleaf-mcp-kit.git"
+  },
+  "dependencies": {
+    "@netique/overleaf-mcp": "^0.3.7",
+    "mcp-proxy": "^6.7.21"
+  }
+}

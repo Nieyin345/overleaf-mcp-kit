@@ -1,0 +1,117 @@
+// Shared pipeline for `edit_file` and `find_and_replace`. The two tools differ
+// only in how they compute the OT op list (one diffs `new_content` against the
+// cached baseline; the other locates `old_string`, validates uniqueness, and
+// builds an op pair). Everything around that — entity resolution, baseline
+// freshness checks, OT submit, post-edit verify, cache sync, response notes —
+// is identical and lives here.
+import { applyOtUpdate } from "../api/socket.js";
+import { ensureDocLoaded, updateDoc } from "../session/docCache.js";
+import { findByPath, getActiveProject } from "../session/activeProject.js";
+import { generateIdSeed, resolveTracking } from "./trackedChanges.js";
+import { checkBaseline, verifyEdit } from "./verify.js";
+export function resolveDocForEdit(path) {
+    const ap = getActiveProject();
+    if (!ap) {
+        return { ok: false, response: { content: [{ type: "text", text: "No project is open. Call open_project first." }], isError: true } };
+    }
+    const resolved = path ?? ap.rootDocPath;
+    if (!resolved) {
+        return { ok: false, response: { content: [{ type: "text", text: "No path provided and the project has no configured root doc. Pass a `path`." }], isError: true } };
+    }
+    const entity = findByPath(resolved);
+    if (!entity) {
+        return {
+            ok: false,
+            response: { content: [{ type: "text", text: `Path not found in project: '${resolved}'. Use list_files to inspect available paths.` }], isError: true },
+        };
+    }
+    if (entity.kind !== "doc") {
+        return {
+            ok: false,
+            response: { content: [{ type: "text", text: `'${resolved}' is a ${entity.kind}, not an editable doc.` }], isError: true },
+        };
+    }
+    return { ok: true, doc: { ap, entity } };
+}
+export async function prepareBaseline(entity, opts) {
+    let cached = await ensureDocLoaded(entity.id);
+    if (opts.expected_version !== undefined && cached.version !== opts.expected_version) {
+        return {
+            ok: false,
+            response: {
+                content: [{ type: "text", text: `Version mismatch: cached version is ${cached.version}, you provided ${opts.expected_version}. Re-read the file and retry.` }],
+                isError: true,
+            },
+        };
+    }
+    if (opts.strict_version) {
+        const bc = await checkBaseline(entity.id, cached.version);
+        updateDoc(entity.id, bc.serverText, bc.serverVersion);
+        if (bc.stale) {
+            return {
+                ok: false,
+                response: {
+                    content: [{ type: "text", text: `Stale baseline (strict_version): cached v${cached.version}, server is at v${bc.serverVersion}. The doc was modified by another writer since you last read it. Re-call read_file before retrying.` }],
+                    isError: true,
+                    structuredContent: {
+                        path: entity.path,
+                        doc_id: entity.id,
+                        stale_baseline: true,
+                        cached_version: cached.version,
+                        server_version: bc.serverVersion,
+                    },
+                },
+            };
+        }
+        cached = { docId: entity.id, text: bc.serverText, version: bc.serverVersion };
+    }
+    return { ok: true, cached };
+}
+// Build + emit the OT update, run post-edit verification, sync the cache to
+// the server's actual state, and compose the shared response-text notes.
+// Tool-specific work (per-tool structuredContent shape, per-tool prose) is
+// the caller's responsibility.
+export async function submitAndVerify(opts) {
+    const { shouldTrack, serverWillTrack, trackOverridden } = resolveTracking(opts.track, opts.ap.trackChangesOnForMe);
+    const update = { doc: opts.entity.id, op: opts.ops, v: opts.cached.version };
+    // `tc` is the only meta key the server accepts from a client; when we're not
+    // tracking, send no `meta` at all (same as the web client with review off).
+    if (shouldTrack)
+        update.meta = { tc: generateIdSeed() };
+    await applyOtUpdate(opts.entity.id, update);
+    const optimisticVersion = opts.cached.version + 1;
+    const trackingNote = serverWillTrack
+        ? (trackOverridden
+            ? "Submitted as a tracked change — `track:\"off\"` was overridden because the project has track_changes_on_for_me. The edit lands as a pending suggestion in Overleaf's Review panel."
+            : "Submitted as tracked changes — should appear as a pending suggestion in Overleaf's Review panel.")
+        : "Submitted as a direct edit (no tracking).";
+    let v;
+    let verifyError;
+    try {
+        v = await verifyEdit(opts.entity.id, opts.preEditText, opts.expectedText, optimisticVersion);
+    }
+    catch (e) {
+        verifyError = e instanceof Error ? e.message : String(e);
+    }
+    // Sync cache to the server's actual state — even on verify failure we want
+    // the next edit to diff against reality rather than our optimistic prediction.
+    if (v)
+        updateDoc(opts.entity.id, v.serverText, v.serverVersion);
+    else
+        updateDoc(opts.entity.id, opts.expectedText, optimisticVersion);
+    const silentNoOp = Boolean(v?.silentNoOp);
+    const versionAfter = v ? v.serverVersion : optimisticVersion;
+    const concurrentNote = v?.hadConcurrentWritesAfter
+        ? ` Note: server is at v${v.serverVersion} (> optimistic v${optimisticVersion}) — another writer landed updates after this edit; your op is in but the doc has moved on.`
+        : !v?.matchesExpected && v
+            ? ` Note: server text doesn't byte-match the predicted post-edit content (cache synced to actual server state at v${v.serverVersion}); the edit landed but may have been OT-transformed.`
+            : "";
+    const verifySkippedNote = verifyError ? ` (post-edit verification skipped: ${verifyError})` : "";
+    return {
+        shouldTrack, serverWillTrack, trackOverridden,
+        optimisticVersion, versionAfter,
+        trackingNote, concurrentNote, verifySkippedNote,
+        v, verifyError, silentNoOp,
+    };
+}
+//# sourceMappingURL=editPipeline.js.map

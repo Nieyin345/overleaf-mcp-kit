@@ -1,0 +1,11 @@
+{
+  "PORT": 0,
+  "HOSTNAME": "",
+  "TUNNEL_MODE": "auto",
+  "AUTH_MODE": "auto",
+  "APIKEY": "",
+  "PROMPT_ON_START": true,
+  "AUTO_LOGIN_ON_START": true,
+  "COOKIE_TTL_DAYS": 30,
+  "COOKIE_KEEPALIVE_MIN": 180
+}

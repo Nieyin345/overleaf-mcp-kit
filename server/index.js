@@ -1,0 +1,109 @@
+#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { registerListProjects } from "./tools/listProjects.js";
+import { registerOpenProject } from "./tools/openProject.js";
+import { registerListFiles } from "./tools/listFiles.js";
+import { registerReadFile } from "./tools/readFile.js";
+import { registerEditFile } from "./tools/editFile.js";
+import { registerFindAndReplace } from "./tools/findAndReplace.js";
+import { registerCompile, registerReadLog } from "./tools/compile.js";
+import { registerComments } from "./tools/comments.js";
+import { registerTrackedChanges } from "./tools/trackedChanges.js";
+import { registerEntityTools } from "./tools/entities.js";
+import { registerDownloadTools } from "./tools/downloads.js";
+import { registerPreviewTools } from "./tools/preview.js";
+import { registerAuthTools } from "./tools/auth.js";
+import { registerMultiReplace } from "./tools/multiReplace.js";
+import { registerSearchTools } from "./tools/search.js";
+import { close as closeActiveProject } from "./session/activeProject.js";
+import { startSessionKeepAlive, stopSessionKeepAlive } from "./session/identity.js";
+import { maybeRunCli } from "./auth/cli.js";
+import { logger } from "./util/logger.js";
+import { instrumentToolLogging } from "./util/toolLogger.js";
+
+const SERVER_NAME = "overleaf-mcp";
+const SERVER_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+
+const INSTRUCTIONS = [
+    "Overleaf MCP server. Operates on .tex files via Overleaf's Socket.IO web API",
+    "(not the Git bridge), so edits land in real time and respect tracked-changes mode.",
+    "",
+    "Every project tool accepts an optional project_id. When MCP sessions may change",
+    "between calls (e.g. behind an HTTP gateway), pass it on every call; the tool opens",
+    "the project when needed. A read with a different project_id switches the active",
+    "project but never retargets writes: a write without project_id is refused unless",
+    "it goes to the project last confirmed by open_project or by a write naming it.",
+    "",
+    "Capabilities include:",
+    "  - Auth: auth_status (live check without popping up browser)",
+    "  - Browse & Search: list_projects, open_project, list_files, read_file (supports start_line/end_line), search_in_project",
+    "  - Edit with Track Changes: edit_file, find_and_replace, multi_replace, list_tracked_changes, accept_changes, reject_changes",
+    "  - Manage & Upload: create_doc, create_folder, upload_file, delete_entity, rename_entity, move_entity",
+    "  - Compile & Preview: compile, read_log, preview_pdf (renders PNG page previews + browser preview URL)",
+    "  - Download: download_file, download_project (zip), download_output (output.pdf, .bbl, etc.)",
+    "  - Review Comments: list_comments, read_comment_thread, add_comment, reply_comment, resolve_comment, reopen_comment",
+    "",
+    "Auth UX (important for the user-facing message):",
+    "If no session cookie is stored yet, or the previous one has expired (Overleaf",
+    "cookies last ~5 days), the next tool call will spawn an isolated Chrome window",
+    "pointed at Overleaf so the user can log in. The window uses a dedicated profile",
+    "that does NOT share the user's main browser data, saved passwords, or any",
+    "password-manager extension — they must type their Overleaf credentials (or",
+    "click their SSO provider) manually. The window then closes automatically.",
+    "Before triggering an Overleaf tool call when you don't already know the user",
+    "is authenticated, briefly warn them: \"a Chrome window may pop up asking you",
+    "to log in — type your credentials there, it's a clean isolated profile.\"",
+].join("\n");
+
+async function main() {
+    const server = instrumentToolLogging(new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS }));
+    server.registerTool("ping", {
+        title: "Ping",
+        description: "Health check. Returns 'pong' and the server version. Does not contact Overleaf.",
+        inputSchema: {},
+        annotations: { readOnlyHint: true, idempotentHint: true },
+    }, async () => ({
+        content: [{ type: "text", text: `pong (${SERVER_NAME} v${SERVER_VERSION})` }],
+    }));
+
+    registerListProjects(server);
+    registerOpenProject(server);
+    registerListFiles(server);
+    registerReadFile(server);
+    registerEditFile(server);
+    registerFindAndReplace(server);
+    registerCompile(server);
+    registerReadLog(server);
+    registerComments(server);
+    registerTrackedChanges(server);
+    registerEntityTools(server);
+    registerDownloadTools(server);
+    registerPreviewTools(server);
+    registerAuthTools(server);
+    registerMultiReplace(server);
+    registerSearchTools(server);
+
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    startSessionKeepAlive();
+    logger.info(`${SERVER_NAME} v${SERVER_VERSION} listening on stdio`);
+
+    const shutdown = async (sig) => {
+        logger.info(`received ${sig}, shutting down`);
+        stopSessionKeepAlive();
+        closeActiveProject();
+        await server.close();
+        process.exit(0);
+    };
+    process.on("SIGINT", () => void shutdown("SIGINT"));
+    process.on("SIGTERM", () => void shutdown("SIGTERM"));
+}
+
+maybeRunCli(process.argv)
+    .then(() => main())
+    .catch((err) => {
+    logger.error("fatal startup error", err instanceof Error ? err.stack ?? err.message : err);
+    process.exit(1);
+});
