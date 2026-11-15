@@ -51,6 +51,7 @@ export async function olPostJson(path, body = {}, extraHeaders = {}) {
         headers: {
             Cookie: id.cookie,
             Connection: "keep-alive",
+            Accept: "application/json, text/plain, */*",
             "Content-Type": "application/json",
             "X-Csrf-Token": id.csrf,
             ...extraHeaders,
@@ -68,6 +69,7 @@ export async function olPostMultipart(path, buildFormData, extraHeaders = {}) {
         headers: {
             Cookie: id.cookie,
             Connection: "keep-alive",
+            Accept: "application/json, text/plain, */*",
             "X-Csrf-Token": id.csrf,
             ...extraHeaders,
         },
@@ -80,6 +82,8 @@ export async function olDelete(path, extraHeaders = {}) {
         headers: {
             Cookie: id.cookie,
             Connection: "keep-alive",
+            Accept: "application/json, text/plain, */*",
+            "Content-Type": "application/json",
             "X-Csrf-Token": id.csrf,
             ...extraHeaders,
         },

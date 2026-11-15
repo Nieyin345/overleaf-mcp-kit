@@ -4,7 +4,17 @@ import { asJson, expectOk, olDelete, olPostJson, olPostMultipart } from "../api/
 import { applyOtUpdate, joinDoc } from "../api/socket.js";
 import { textToOps } from "../ot/diff.js";
 import { generateIdSeed, resolveTracking } from "../ot/trackedChanges.js";
-import { findByPath, getRootFolderId, refreshTree } from "../session/activeProject.js";
+import {
+    findByPath,
+    getRootFolderId,
+    refreshTree,
+    syncTreeAddDoc,
+    syncTreeAddFile,
+    syncTreeAddFolder,
+    syncTreeMoveEntity,
+    syncTreeRemoveEntity,
+    syncTreeRenameEntity,
+} from "../session/activeProject.js";
 import { deleteDocFromCache, updateDoc } from "../session/docCache.js";
 import { logger } from "../util/logger.js";
 import { looksLikeUtf8Text, mimeForName, normalizeProjectPath } from "../util/mime.js";
@@ -69,13 +79,17 @@ export class EntityService {
             if (!newId) {
                 throw new Error(`Overleaf did not return folder id when creating '${currentPrefix}'`);
             }
+            syncTreeAddFolder(ap.projectId, currentParentId, {
+                _id: newId,
+                name: data.name ?? seg,
+                folders: data.folders ?? [],
+                docs: data.docs ?? [],
+                fileRefs: data.fileRefs ?? [],
+            });
             currentParentId = newId;
             created.push({ path: currentPrefix, id: newId });
         }
 
-        if (created.length > 0) {
-            await refreshTree(ap.projectId);
-        }
         return { folderId: currentParentId, created };
     }
 
@@ -120,13 +134,13 @@ export class EntityService {
         if (!docId) {
             throw new Error(`Overleaf did not return doc_id when creating '${normalized}'`);
         }
+        syncTreeAddDoc(ap.projectId, folderId, { _id: docId, name: data.name ?? name });
 
         let version = 0;
         if (opts.content !== undefined && opts.content.length > 0) {
             const written = await this.writeDocContent(ap, docId, opts.content, opts.track ?? "off");
             version = written.version;
         }
-        await refreshTree(ap.projectId);
         return {
             path: normalized,
             doc_id: docId,
@@ -183,6 +197,29 @@ export class EntityService {
         return { buffer, sourceType: "local_path", localPath: resolvedLocal };
     }
 
+    async deleteRemoteEntity(ap, entity) {
+        const res = await olDelete(`project/${ap.projectId}/${entity.kind}/${entity.id}`);
+        if (res.status === 404) {
+            logger.warn(`DELETE project/${ap.projectId}/${entity.kind}/${entity.id} returned HTTP 404 for '${entity.path}'; refreshing tree from server to verify state`);
+            const freshAp = await refreshTree(ap.projectId);
+            const refreshed = freshAp.entities.find((e) => e.path === entity.path);
+            if (!refreshed) {
+                logger.info(`entity '${entity.path}' is already absent on server after 404; removing stale cache entry`);
+                return { entityId: entity.id, kind: entity.kind, alreadyAbsent: true };
+            }
+            if (refreshed.id !== entity.id || refreshed.kind !== entity.kind) {
+                logger.info(`retrying DELETE with refreshed ${refreshed.kind} id=${refreshed.id} for '${entity.path}'`);
+                const retryRes = await olDelete(`project/${freshAp.projectId}/${refreshed.kind}/${refreshed.id}`);
+                await expectOk(retryRes, `DELETE project/${freshAp.projectId}/${refreshed.kind}/${refreshed.id}`);
+                syncTreeRemoveEntity(freshAp.projectId, refreshed.id);
+                return { entityId: refreshed.id, kind: refreshed.kind, alreadyAbsent: false };
+            }
+        }
+        await expectOk(res, `DELETE project/${ap.projectId}/${entity.kind}/${entity.id}`);
+        syncTreeRemoveEntity(ap.projectId, entity.id);
+        return { entityId: entity.id, kind: entity.kind, alreadyAbsent: false };
+    }
+
     async uploadFile(ap, targetPath, opts = {}) {
         const { normalized, parentPath, name } = this.splitParentAndName(targetPath);
         const { buffer, sourceType } = await this.resolveUploadBuffer(opts);
@@ -214,8 +251,7 @@ export class EntityService {
             }
             // Remove existing fileRef (or doc replaced by binary) so Overleaf doesn't keep duplicate names.
             logger.info(`upload_file removing existing ${existing.kind} '${normalized}' (${existing.id}) before upload`);
-            const delRes = await olDelete(`project/${ap.projectId}/${existing.kind}/${existing.id}`);
-            await expectOk(delRes, `DELETE project/${ap.projectId}/${existing.kind}/${existing.id}`);
+            await this.deleteRemoteEntity(ap, existing);
             if (existing.kind === "doc") {
                 deleteDocFromCache(existing.id);
             }
@@ -239,12 +275,24 @@ export class EntityService {
             throw new Error(`Overleaf rejected upload for '${normalized}': ${JSON.stringify(result)}`);
         }
 
-        await refreshTree(ap.projectId);
+        const uploadedId = result.entity_id ?? result._id ?? result.id;
+        const uploadedKind = result.entity_type === "doc" ? "doc" : "file";
+        if (uploadedId) {
+            if (uploadedKind === "doc") {
+                syncTreeAddDoc(ap.projectId, folderId, { _id: uploadedId, name });
+            }
+            else {
+                syncTreeAddFile(ap.projectId, folderId, { _id: uploadedId, name });
+            }
+        }
+        else {
+            await refreshTree(ap.projectId);
+        }
         const refreshed = findByPath(normalized);
         return {
             path: normalized,
-            entity_id: refreshed?.id ?? result.entity_id,
-            kind: refreshed?.kind ?? result.entity_type ?? "file",
+            entity_id: refreshed?.id ?? uploadedId,
+            kind: refreshed?.kind ?? uploadedKind,
             replaced: Boolean(existing),
             method: "multipart_upload",
             byte_count: buffer.length,
@@ -273,23 +321,22 @@ export class EntityService {
         }
 
         logger.info(`deleting ${entity.kind} '${normalized}' (id=${entity.id})`);
-        const res = await olDelete(`project/${ap.projectId}/${entity.kind}/${entity.id}`);
-        await expectOk(res, `DELETE project/${ap.projectId}/${entity.kind}/${entity.id}`);
+        const deleted = await this.deleteRemoteEntity(ap, entity);
 
-        if (entity.kind === "doc") {
-            deleteDocFromCache(entity.id);
+        if (deleted.kind === "doc") {
+            deleteDocFromCache(deleted.entityId);
         }
         for (const d of childDocs) {
             deleteDocFromCache(d.id);
         }
 
-        await refreshTree(ap.projectId);
         return {
             deleted: true,
             path: normalized,
-            kind: entity.kind,
-            entity_id: entity.id,
+            kind: deleted.kind,
+            entity_id: deleted.entityId,
             children_deleted: childDocs.length,
+            ...(deleted.alreadyAbsent ? { already_absent: true } : {}),
         };
     }
 
@@ -308,7 +355,7 @@ export class EntityService {
             name: cleanName,
         });
         await expectOk(res, `POST project/${ap.projectId}/${entity.kind}/${entity.id}/rename`);
-        await refreshTree(ap.projectId);
+        syncTreeRenameEntity(ap.projectId, entity.id, cleanName);
 
         const parentPrefix = normalized.includes("/") ? normalized.slice(0, normalized.lastIndexOf("/") + 1) : "";
         return {
@@ -333,7 +380,7 @@ export class EntityService {
             folder_id: folderId,
         });
         await expectOk(res, `POST project/${ap.projectId}/${entity.kind}/${entity.id}/move`);
-        await refreshTree(ap.projectId);
+        syncTreeMoveEntity(ap.projectId, entity.id, folderId);
 
         return {
             moved: true,

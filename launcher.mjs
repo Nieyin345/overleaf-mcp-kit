@@ -238,6 +238,7 @@ const args = [
   "127.0.0.1",
   "--port",
   String(internalPort),
+  "--stateless",
   "--sessionIdleTimeout",
   "0",
   "--maxBodySize",

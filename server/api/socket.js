@@ -425,19 +425,17 @@ export async function applyOtUpdate(docId, update) {
 }
 export async function refreshJoinedProject(projectId) {
     return withReconnectingSocket(async () => {
-        if (!active || !active.isOpen() || active.projectId !== projectId) {
-            return await ensureSocketForProject(projectId);
+        // Overleaf's v2 Socket.IO endpoint auto-joins on WS connect via `joinProjectResponse`
+        // and does not ack subsequent `joinProject` emits on an already-joined socket.
+        // Reconnecting cleanly fetches the authoritative project tree without hitting the 15s ack timeout.
+        if (active && active.projectId === projectId) {
+            logger.info(`reconnecting socket to refresh project tree (project=${projectId})`);
+            active.disconnect();
+            active = null;
         }
-        const ret = await active.emit("joinProject", [{ project_id: projectId }]);
-        const tuple = Array.isArray(ret) ? ret : [ret];
-        const [project, perm, proto] = tuple;
-        if (project) {
-            active.joinedProject = project;
-            active.permissionsLevel = perm ?? active.permissionsLevel;
-            active.protocolVersion = typeof proto === "number" ? proto : active.protocolVersion;
-        }
-        logger.info(`refreshed project tree via socket (project=${projectId})`);
-        return { socket: active, publicId: active.publicId ?? undefined, joinedProject: active.joinedProject ?? undefined };
+        const joined = await ensureSocketForProject(projectId);
+        logger.info(`refreshed project tree via socket reconnect (project=${projectId})`);
+        return joined;
     });
 }
 export function disconnectActive() {

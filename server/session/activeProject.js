@@ -1,8 +1,174 @@
 import { ensureSocketForProject, refreshJoinedProject, disconnectActive } from "../api/socket.js";
 import { flattenTree, isTrackChangesOnForUser } from "../api/projectTypes.js";
+import { logger } from "../util/logger.js";
 import { getIdentity } from "./identity.js";
-import { clearDocCache } from "./docCache.js";
+import { clearDocCache, deleteDocFromCache } from "./docCache.js";
 let active = null;
+const BUCKET_KEYS = ["folders", "docs", "fileRefs"];
+
+/**
+ * Maintains in-memory synchronization of Overleaf's `rootFolder` tree and flattened
+ * `entities` cache after REST mutations or real-time Socket.IO tree events, eliminating
+ * blocking re-join calls on already-joined sockets.
+ */
+export class ProjectTreeMutator {
+    ensureFolderShape(folder) {
+        if (!Array.isArray(folder.folders))
+            folder.folders = [];
+        if (!Array.isArray(folder.docs))
+            folder.docs = [];
+        if (!Array.isArray(folder.fileRefs))
+            folder.fileRefs = [];
+        return folder;
+    }
+
+    findFolder(folder, folderId) {
+        if (!folder)
+            return null;
+        this.ensureFolderShape(folder);
+        if (!folderId || String(folder._id) === String(folderId))
+            return folder;
+        for (const sub of folder.folders) {
+            const hit = this.findFolder(sub, folderId);
+            if (hit)
+                return hit;
+        }
+        return null;
+    }
+
+    findEntityLocation(folder, entityId) {
+        if (!folder)
+            return null;
+        this.ensureFolderShape(folder);
+        for (const key of BUCKET_KEYS) {
+            const arr = folder[key];
+            const idx = arr.findIndex((item) => String(item._id) === String(entityId));
+            if (idx >= 0) {
+                return { parent: folder, bucketKey: key, index: idx, item: arr[idx] };
+            }
+        }
+        for (const sub of folder.folders) {
+            const nested = this.findEntityLocation(sub, entityId);
+            if (nested)
+                return nested;
+        }
+        return null;
+    }
+
+    rebuild(ap) {
+        const root = ap?.project?.rootFolder?.[0];
+        if (!root)
+            return ap;
+        this.ensureFolderShape(root);
+        ap.entities = flattenTree(root);
+        ap.rootDocPath = ap.rootDocId
+            ? ap.entities.find((e) => e.kind === "doc" && e.id === ap.rootDocId)?.path
+            : undefined;
+        return ap;
+    }
+
+    addEntity(ap, parentFolderId, bucketKey, entity) {
+        const root = ap?.project?.rootFolder?.[0];
+        if (!root || !entity?._id)
+            return false;
+        const parent = this.findFolder(root, parentFolderId) ?? root;
+        this.ensureFolderShape(parent);
+        const normalized = bucketKey === "folders"
+            ? this.ensureFolderShape({ _id: entity._id, name: entity.name, folders: entity.folders ?? [], docs: entity.docs ?? [], fileRefs: entity.fileRefs ?? [] })
+            : { ...entity };
+        const bucket = parent[bucketKey];
+        const existingIdx = bucket.findIndex((x) => String(x._id) === String(entity._id));
+        if (existingIdx >= 0) {
+            bucket[existingIdx] = bucketKey === "folders"
+                ? { ...bucket[existingIdx], name: normalized.name }
+                : { ...bucket[existingIdx], ...normalized };
+        }
+        else {
+            bucket.push(normalized);
+        }
+        this.rebuild(ap);
+        logger.debug(`tree sync add (${bucketKey}): '${normalized.name}' id=${normalized._id} parent=${parent._id}`);
+        return true;
+    }
+
+    removeEntity(ap, entityId) {
+        const root = ap?.project?.rootFolder?.[0];
+        if (!root || !entityId)
+            return false;
+        const loc = this.findEntityLocation(root, entityId);
+        if (!loc)
+            return false;
+        loc.parent[loc.bucketKey].splice(loc.index, 1);
+        this.rebuild(ap);
+        logger.debug(`tree sync remove (${loc.bucketKey}): id=${entityId}`);
+        return true;
+    }
+
+    renameEntity(ap, entityId, newName) {
+        const root = ap?.project?.rootFolder?.[0];
+        if (!root || !entityId)
+            return false;
+        const loc = this.findEntityLocation(root, entityId);
+        if (!loc)
+            return false;
+        loc.item.name = newName;
+        this.rebuild(ap);
+        logger.debug(`tree sync rename (${loc.bucketKey}): id=${entityId} -> '${newName}'`);
+        return true;
+    }
+
+    moveEntity(ap, entityId, destFolderId) {
+        const root = ap?.project?.rootFolder?.[0];
+        if (!root || !entityId)
+            return false;
+        const loc = this.findEntityLocation(root, entityId);
+        if (!loc)
+            return false;
+        const dest = this.findFolder(root, destFolderId) ?? root;
+        if (String(loc.parent._id) === String(dest._id))
+            return false;
+        loc.parent[loc.bucketKey].splice(loc.index, 1);
+        this.ensureFolderShape(dest);
+        dest[loc.bucketKey].push(loc.item);
+        this.rebuild(ap);
+        logger.debug(`tree sync move (${loc.bucketKey}): id=${entityId} -> folder=${dest._id}`);
+        return true;
+    }
+}
+
+export const treeMutator = new ProjectTreeMutator();
+
+function attachSocketTreeListeners(socket, projectId) {
+    if (!socket || socket.__treeListenersAttached)
+        return;
+    socket.__treeListenersAttached = true;
+    socket.on("reciveNewFolder", ([parentFolderId, folder]) => {
+        if (active?.projectId === projectId && folder)
+            treeMutator.addEntity(active, parentFolderId, "folders", folder);
+    });
+    socket.on("reciveNewDoc", ([parentFolderId, doc]) => {
+        if (active?.projectId === projectId && doc)
+            treeMutator.addEntity(active, parentFolderId, "docs", doc);
+    });
+    socket.on("reciveNewFile", ([parentFolderId, file]) => {
+        if (active?.projectId === projectId && file)
+            treeMutator.addEntity(active, parentFolderId, "fileRefs", file);
+    });
+    socket.on("removeEntity", ([entityId]) => {
+        if (active?.projectId === projectId && entityId) {
+            treeMutator.removeEntity(active, entityId);
+            deleteDocFromCache(entityId);
+        }
+    });
+    socket.on("reciveEntityRename", ([entityId, newName]) => {
+        if (active?.projectId === projectId && entityId && newName)
+            treeMutator.renameEntity(active, entityId, newName);
+    });
+    socket.on("reciveEntityMove", ([entityId, destFolderId]) => {
+        if (active?.projectId === projectId && entityId)
+            treeMutator.moveEntity(active, entityId, destFolderId);
+    });
+}
 export function setLastCompile(result) {
     if (active)
         active.lastCompile = result;
@@ -73,10 +239,11 @@ async function buildActiveProjectState(projectId, joinedProject) {
     };
 }
 export async function open(projectId) {
-    const { joinedProject } = await ensureSocketForProject(projectId);
+    const { socket, joinedProject } = await ensureSocketForProject(projectId);
     if (!joinedProject) {
         throw new Error("joinProject did not return a project entity");
     }
+    attachSocketTreeListeners(socket, projectId);
     clearDocCache();
     active = await buildActiveProjectState(projectId, joinedProject);
     return active;
@@ -86,12 +253,43 @@ export async function refreshTree(projectId) {
     if (!targetId) {
         throw new Error("No active project to refresh");
     }
-    const { joinedProject } = await refreshJoinedProject(targetId);
+    const { socket, joinedProject } = await refreshJoinedProject(targetId);
     if (!joinedProject) {
         throw new Error("refreshJoinedProject did not return a project entity");
     }
+    attachSocketTreeListeners(socket, targetId);
     active = await buildActiveProjectState(targetId, joinedProject);
     return active;
+}
+export function syncTreeAddFolder(projectId, parentFolderId, folderObj) {
+    if (!active || active.projectId !== projectId)
+        return false;
+    return treeMutator.addEntity(active, parentFolderId, "folders", folderObj);
+}
+export function syncTreeAddDoc(projectId, parentFolderId, docObj) {
+    if (!active || active.projectId !== projectId)
+        return false;
+    return treeMutator.addEntity(active, parentFolderId, "docs", docObj);
+}
+export function syncTreeAddFile(projectId, parentFolderId, fileObj) {
+    if (!active || active.projectId !== projectId)
+        return false;
+    return treeMutator.addEntity(active, parentFolderId, "fileRefs", fileObj);
+}
+export function syncTreeRemoveEntity(projectId, entityId) {
+    if (!active || active.projectId !== projectId)
+        return false;
+    return treeMutator.removeEntity(active, entityId);
+}
+export function syncTreeRenameEntity(projectId, entityId, newName) {
+    if (!active || active.projectId !== projectId)
+        return false;
+    return treeMutator.renameEntity(active, entityId, newName);
+}
+export function syncTreeMoveEntity(projectId, entityId, destFolderId) {
+    if (!active || active.projectId !== projectId)
+        return false;
+    return treeMutator.moveEntity(active, entityId, destFolderId);
 }
 export function getRootFolderId(ap) {
     return ap.project?.rootFolder?.[0]?._id;

@@ -54,14 +54,16 @@ export class CompileService {
     }
 
     async compileProject(ap, opts = {}) {
+        const requestedRoot = typeof opts.root_doc === "string" ? opts.root_doc.trim() : "";
+        const resolvedRootDoc = requestedRoot || ap.rootDocPath || undefined;
         const body = {
             check: "silent",
             draft: Boolean(opts.draft),
             incrementalCompilesEnabled: true,
-            rootResourcePath: opts.root_doc ?? null,
             stopOnFirstError: Boolean(opts.stop_on_first_error),
+            ...(resolvedRootDoc ? { rootResourcePath: resolvedRootDoc } : {}),
         };
-        logger.info(`compile start project=${ap.projectId} draft=${body.draft} root_doc=${body.rootResourcePath ?? "(default)"}`);
+        logger.info(`compile start project=${ap.projectId} draft=${body.draft} root_doc=${resolvedRootDoc ?? "(server-default)"}`);
         const res = await olPostJson(`project/${ap.projectId}/compile?auto_compile=true`, body);
         const result = await asJson(res, `POST project/${ap.projectId}/compile`);
         setLastCompile(result);

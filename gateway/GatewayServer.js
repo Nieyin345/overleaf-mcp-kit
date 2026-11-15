@@ -134,10 +134,34 @@ export class GatewayServer {
         return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
     }
 
-    static logHttp(method, reqPath, status, ms) {
+    static extractRpcLabel(rawBody) {
+        if (!rawBody) return "";
+        try {
+            const parsed = JSON.parse(rawBody);
+            const first = Array.isArray(parsed) ? parsed[0] : parsed;
+            if (!first || typeof first.method !== "string") return "";
+            if (first.method === "tools/call" && typeof first.params?.name === "string") {
+                return ` [${first.method}:${first.params.name}]`;
+            }
+            return ` [${first.method}]`;
+        }
+        catch {
+            return "";
+        }
+    }
+
+    static logHttp(method, reqPath, status, ms, extra = "") {
         const ts = GatewayServer.formatTimestamp();
-        const badge = status >= 400 ? "\x1b[31m⚠️" : "\x1b[90m🌐";
-        console.log(`\x1b[90m${ts}\x1b[0m ${badge} [HTTP] ${method} ${reqPath} → ${status} (${ms}ms)\x1b[0m`);
+        const isWellKnown404 = status === 404 && reqPath.startsWith("/.well-known/");
+        const isStateless405 = status === 405 && (method === "GET" || method === "DELETE") && reqPath.startsWith("/mcp");
+        let badge = "\x1b[90m🌐";
+        if (isWellKnown404 || isStateless405) {
+            badge = "\x1b[90mℹ️ ";
+        }
+        else if (status >= 400) {
+            badge = "\x1b[31m⚠️";
+        }
+        console.log(`\x1b[90m${ts}\x1b[0m ${badge} [HTTP] ${method} ${reqPath}${extra} → ${status} (${ms}ms)\x1b[0m`);
     }
 
     /**
@@ -246,6 +270,34 @@ export class GatewayServer {
                 headers["x-api-key"] = bearer[1].trim();
             }
         }
+
+        // Non-blocking peek of small JSON-RPC request bodies so console logs show
+        // exact MCP methods (initialize, tools/list, tools/call:...) in real time.
+        let rpcLabel = "";
+        const shouldPeekRpc = method === "POST"
+            && reqPath.startsWith("/mcp")
+            && String(headers["content-type"] || "").includes("application/json");
+        if (shouldPeekRpc) {
+            const peekChunks = [];
+            let peekBytes = 0;
+            let overflow = false;
+            req.on("data", (chunk) => {
+                if (overflow) return;
+                peekBytes += chunk.length;
+                if (peekBytes > 16_384) {
+                    overflow = true;
+                    peekChunks.length = 0;
+                    return;
+                }
+                peekChunks.push(chunk);
+            });
+            req.on("end", () => {
+                if (!overflow && peekChunks.length > 0) {
+                    rpcLabel = GatewayServer.extractRpcLabel(Buffer.concat(peekChunks).toString("utf8"));
+                }
+            });
+        }
+
         const proxyReq = http.request({
             hostname: this.upstreamHost,
             port: this.upstreamPort,
@@ -255,8 +307,28 @@ export class GatewayServer {
         }, (proxyRes) => {
             const status = proxyRes.statusCode ?? 502;
             const ms = Date.now() - startedAt;
-            GatewayServer.logHttp(method, reqPath, status, ms);
+            GatewayServer.logHttp(method, reqPath, status, ms, rpcLabel);
             res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+
+            const isUnexpectedMcpError = status >= 400
+                && status !== 405
+                && !reqPath.startsWith("/.well-known/");
+            if (isUnexpectedMcpError) {
+                const errChunks = [];
+                let errBytes = 0;
+                proxyRes.on("data", (chunk) => {
+                    if (errBytes < 512) {
+                        errChunks.push(chunk);
+                        errBytes += chunk.length;
+                    }
+                });
+                proxyRes.on("end", () => {
+                    const snippet = Buffer.concat(errChunks).toString("utf8").replace(/\s+/g, " ").trim().slice(0, 200);
+                    if (snippet) {
+                        console.log(`\x1b[90m   └─ ⚠️ ${status} 响应详情: ${snippet}\x1b[0m`);
+                    }
+                });
+            }
             proxyRes.pipe(res);
         });
 

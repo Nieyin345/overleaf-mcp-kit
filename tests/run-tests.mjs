@@ -77,8 +77,31 @@ async function testMcpStdioTools() {
     for (const name of expected) {
         assert.ok(names.has(name), `Missing expected MCP tool: ${name}`);
     }
+    // Verify Gemini / strict OpenAPI schema compatibility across all tools
+    const forbiddenKeys = new Set(["$schema", "default", "additionalProperties"]);
+    const walkSchema = (node, toolName) => {
+        if (Array.isArray(node)) {
+            for (const item of node) walkSchema(item, toolName);
+            return;
+        }
+        if (!node || typeof node !== "object") return;
+        for (const [k, v] of Object.entries(node)) {
+            assert.ok(!forbiddenKeys.has(k), `Tool '${toolName}' schema leaked unsupported key '${k}'`);
+            if (k === "minimum") assert.notEqual(v, Number.MIN_SAFE_INTEGER, `Tool '${toolName}' leaked MIN_SAFE_INTEGER`);
+            if (k === "maximum") assert.notEqual(v, Number.MAX_SAFE_INTEGER, `Tool '${toolName}' leaked MAX_SAFE_INTEGER`);
+            walkSchema(v, toolName);
+        }
+    };
+    for (const tool of list.tools) {
+        assert.equal(tool.execution, undefined, `Tool '${tool.name}' should not emit forbidden task execution metadata`);
+        walkSchema(tool.inputSchema, tool.name);
+        if (tool.outputSchema) walkSchema(tool.outputSchema, tool.name);
+    }
+    const listProjectsTool = list.tools.find((t) => t.name === "list_projects");
+    assert.equal(listProjectsTool.inputSchema.properties.limit.minimum, 1);
+    assert.equal(listProjectsTool.inputSchema.properties.limit.maximum, 500);
     await client.close();
-    console.log(`[PASS] Verified all ${expected.length} MCP tools over stdio.`);
+    console.log(`[PASS] Verified all ${expected.length} MCP tools & Gemini-compatible schemas over stdio.`);
 }
 
 async function testGatewayAndArtifacts() {
@@ -122,6 +145,7 @@ async function testGatewayAndArtifacts() {
             "node_modules/mcp-proxy/dist/bin/mcp-proxy.mjs",
             "--host", "127.0.0.1",
             "--port", String(internalPort),
+            "--stateless",
             "--sessionIdleTimeout", "0",
             "--", "./node/node.exe", "server/index.js",
         ],
@@ -159,8 +183,6 @@ async function testGatewayAndArtifacts() {
                 });
                 if (probe.status !== 502) {
                     assert.equal(probe.status, 200);
-                    const sid = probe.headers.get("mcp-session-id");
-                    assert.ok(sid, "mcp-proxy should return mcp-session-id through GatewayServer");
                     initialized = true;
                     break;
                 }
@@ -172,12 +194,34 @@ async function testGatewayAndArtifacts() {
         }
         assert.ok(initialized, "mcp-proxy failed to initialize through GatewayServer");
 
-        // Test MCP HTTP probe endpoints (HEAD /mcp -> 200, GET /mcp w/o session -> 405, /healthz -> 200)
+        // Stale/unknown Mcp-Session-Id must still succeed in stateless mode (no 404 Session not found)
+        const toolsWithStaleSid = await fetch(`http://127.0.0.1:${publicPort}/mcp`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Accept: "application/json, text/event-stream",
+                "Mcp-Session-Id": "4d075022-df1a-41f7-9be1-ba5e68540095",
+            },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+        });
+        assert.equal(toolsWithStaleSid.status, 200, "POST /mcp with stale Mcp-Session-Id must succeed in stateless mode");
+
+        // Test MCP HTTP probe endpoints (HEAD /mcp -> 200, GET /mcp -> 405, DELETE /mcp -> 405, /healthz -> 200)
         const headMcp = await fetch(`http://127.0.0.1:${publicPort}/mcp`, { method: "HEAD" });
         assert.equal(headMcp.status, 200, "HEAD /mcp should return 200 for Web AI health probes");
         assert.ok(headMcp.headers.get("mcp-protocol-version"));
         const getMcpNoSid = await fetch(`http://127.0.0.1:${publicPort}/mcp`, { method: "GET" });
-        assert.equal(getMcpNoSid.status, 405, "GET /mcp without Mcp-Session-Id should return 405");
+        assert.equal(getMcpNoSid.status, 405, "GET /mcp should return 405 in stateless mode");
+        const getMcpWithSid = await fetch(`http://127.0.0.1:${publicPort}/mcp`, {
+            method: "GET",
+            headers: { "Mcp-Session-Id": "4d075022-df1a-41f7-9be1-ba5e68540095" },
+        });
+        assert.equal(getMcpWithSid.status, 405, "GET /mcp with stale sid should return 405 in stateless mode");
+        const delMcp = await fetch(`http://127.0.0.1:${publicPort}/mcp`, {
+            method: "DELETE",
+            headers: { "Mcp-Session-Id": "4d075022-df1a-41f7-9be1-ba5e68540095" },
+        });
+        assert.equal(delMcp.status, 405, "DELETE /mcp should return 405 (not 404) in stateless mode");
         const hzRes = await fetch(`http://127.0.0.1:${publicPort}/healthz`);
         assert.equal(hzRes.status, 200);
 
@@ -328,14 +372,57 @@ async function testMockOverleafWorkflow() {
         }
         if (req.method === "DELETE" && /^\/project\/proj000001\/(doc|file|folder)\//.test(p)) {
             const [, , , kind, id] = p.split("/");
+            let found = false;
             const removeFrom = (f) => {
+                const dLen = f.docs.length;
                 f.docs = f.docs.filter((d) => d._id !== id);
+                if (f.docs.length !== dLen) found = true;
+                const fLen = f.fileRefs.length;
                 f.fileRefs = f.fileRefs.filter((x) => x._id !== id);
+                if (f.fileRefs.length !== fLen) found = true;
+                const subLen = f.folders.length;
                 f.folders = f.folders.filter((sub) => sub._id !== id);
+                if (f.folders.length !== subLen) found = true;
                 for (const sub of f.folders) removeFrom(sub);
             };
             removeFrom(rootFolder);
+            if (!found) {
+                res.writeHead(404, { "Content-Type": "text/plain" });
+                res.end("Not Found");
+                return;
+            }
             events.push(`delete:${kind}:${id}`);
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+        if (req.method === "POST" && /^\/project\/proj000001\/(doc|file|folder)\/[^/]+\/move$/.test(p)) {
+            const [, , , kind, id] = p.split("/");
+            const body = JSON.parse(rawBody.toString("utf8"));
+            let movedItem = null;
+            const extractFrom = (f) => {
+                for (const [key, arr] of [["docs", f.docs], ["fileRefs", f.fileRefs], ["folders", f.folders]]) {
+                    const idx = arr.findIndex((x) => x._id === id);
+                    if (idx >= 0) {
+                        movedItem = { key, item: arr.splice(idx, 1)[0] };
+                        return;
+                    }
+                }
+                for (const sub of f.folders) extractFrom(sub);
+            };
+            const findFolder = (f) => {
+                if (f._id === body.folder_id) return f;
+                for (const sub of f.folders) {
+                    const hit = findFolder(sub);
+                    if (hit) return hit;
+                }
+                return null;
+            };
+            extractFrom(rootFolder);
+            const dest = findFolder(rootFolder);
+            assert.ok(movedItem && dest, `move target not found (${kind}:${id} -> ${body.folder_id})`);
+            dest[movedItem.key].push(movedItem.item);
+            events.push(`move:${kind}:${id}`);
             res.writeHead(204);
             res.end();
             return;
@@ -363,6 +450,13 @@ async function testMockOverleafWorkflow() {
             return;
         }
         if (req.method === "POST" && p === "/project/proj000001/compile") {
+            const body = JSON.parse(rawBody.toString("utf8"));
+            assert.notEqual(body.rootResourcePath, null, "compile must never send rootResourcePath: null (Overleaf Zod rejects null with HTTP 400)");
+            if (body.rootResourcePath !== undefined) {
+                assert.equal(typeof body.rootResourcePath, "string");
+                assert.ok(body.rootResourcePath.length > 0);
+            }
+            assert.equal(body.rootResourcePath, "main.tex", "compile without root_doc should default to active rootDocPath");
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({
                 status: "success",
@@ -418,7 +512,9 @@ async function testMockOverleafWorkflow() {
                 const ackId = m[1];
                 const { name, args } = JSON.parse(m[2]);
                 if (name === "joinProject") {
-                    ws.send(`6:::${ackId}+${JSON.stringify([null, { _id: "proj000001", name: "MockPaper", rootDoc_id: "doc00001", rootFolder: [rootFolder] }, "owner", 2])}`);
+                    // Simulate Overleaf v2 behavior: already-joined socket NEVER acks subsequent joinProject emits!
+                    // Any caller relying on emit("joinProject") on an already-joined socket will time out.
+                    return;
                 }
                 else if (name === "joinDoc") {
                     const docId = args[0];
@@ -545,6 +641,41 @@ async function testMockOverleafWorkflow() {
         // Delete uploaded file
         const delFile = await client.callTool({ name: "delete_entity", arguments: { path: "figures/chart.png" } });
         assert.ok(!delFile.isError, delFile.content[0].text);
+
+        // Create empty folder explicitly, verify immediate tree sync, move a doc in/out, and delete empty folder
+        const mkFldRes = await client.callTool({ name: "create_folder", arguments: { path: "__mcp_tool_test_20261115" } });
+        assert.ok(!mkFldRes.isError, mkFldRes.content[0].text);
+        const mkSubDocRes = await client.callTool({
+            name: "create_doc",
+            arguments: { path: "__mcp_tool_test_20261115/temp_note.tex", content: "temp" },
+        });
+        assert.ok(!mkSubDocRes.isError, mkSubDocRes.content[0].text);
+        const mvRes = await client.callTool({
+            name: "move_entity",
+            arguments: { path: "__mcp_tool_test_20261115/temp_note.tex", destination_folder: "chapters" },
+        });
+        assert.ok(!mvRes.isError, mvRes.content[0].text);
+        const delEmptyFld = await client.callTool({ name: "delete_entity", arguments: { path: "__mcp_tool_test_20261115" } });
+        assert.ok(!delEmptyFld.isError, delEmptyFld.content[0].text);
+
+        // Out-of-band server deletion -> client gets 404 on DELETE -> refreshes cleanly and succeeds as already_absent
+        const oobDocRes = await client.callTool({ name: "create_doc", arguments: { path: "chapters/gone.tex", content: "x" } });
+        assert.ok(!oobDocRes.isError, oobDocRes.content[0].text);
+        const chapFld = rootFolder.folders.find((f) => f.name === "chapters");
+        chapFld.docs = chapFld.docs.filter((d) => d.name !== "gone.tex");
+        const delGone = await client.callTool({ name: "delete_entity", arguments: { path: "chapters/gone.tex" } });
+        assert.ok(!delGone.isError, delGone.content[0].text);
+
+        // Non-empty folder requires recursive: true
+        const delNonEmptyFail = await client.callTool({ name: "delete_entity", arguments: { path: "chapters" } });
+        assert.ok(delNonEmptyFail.isError, "Non-empty folder should refuse delete without recursive: true");
+        const delRecursiveOk = await client.callTool({ name: "delete_entity", arguments: { path: "chapters", recursive: true } });
+        assert.ok(!delRecursiveOk.isError, delRecursiveOk.content[0].text);
+
+        // Compile directly WITHOUT root_doc (must not send rootResourcePath: null)
+        const cmpRes = await client.callTool({ name: "compile", arguments: {} });
+        assert.ok(!cmpRes.isError, cmpRes.content[0].text);
+        assert.match(cmpRes.content[0].text, /Built cleanly/);
 
         // Download project zip
         const zipRes = await client.callTool({ name: "download_project", arguments: {} });

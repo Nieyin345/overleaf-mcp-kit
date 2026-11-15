@@ -22,6 +22,7 @@ import { startSessionKeepAlive, stopSessionKeepAlive } from "./session/identity.
 import { maybeRunCli } from "./auth/cli.js";
 import { logger } from "./util/logger.js";
 import { instrumentToolLogging } from "./util/toolLogger.js";
+import { installSchemaSanitizer } from "./util/schemaSanitizer.js";
 
 const SERVER_NAME = "overleaf-mcp";
 const SERVER_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
@@ -58,7 +59,9 @@ const INSTRUCTIONS = [
 ].join("\n");
 
 async function main() {
-    const server = instrumentToolLogging(new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS }));
+    const server = installSchemaSanitizer(
+        instrumentToolLogging(new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS }))
+    );
     server.registerTool("ping", {
         title: "Ping",
         description: "Health check. Returns 'pong' and the server version. Does not contact Overleaf.",
