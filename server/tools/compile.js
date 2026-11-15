@@ -1,5 +1,7 @@
 import { z } from "zod";
+import { OverleafApiError } from "../api/errors.js";
 import { compileService } from "../services/CompileService.js";
+import { setLastCompile } from "../session/activeProject.js";
 import { logger } from "../util/logger.js";
 import { projectIdArg, projectTool } from "./project.js";
 
@@ -86,7 +88,25 @@ export function registerReadLog(server) {
             return { content: [{ type: "text", text: "The last compile produced no output.log (it may have failed before reaching LaTeX)." }], isError: true };
         }
         try {
-            const fullLog = await compileService.fetchOutputText(last, "output.log");
+            let fullLog;
+            try {
+                fullLog = await compileService.fetchOutputText(last, "output.log");
+            }
+            catch (fetchErr) {
+                if (fetchErr instanceof OverleafApiError && fetchErr.status === 404) {
+                    if (typeof last._cachedLog === "string") {
+                        logger.warn("read_log: CLSI build expired (404); serving cached output.log from last compile");
+                        fullLog = last._cachedLog;
+                    }
+                    else {
+                        setLastCompile(undefined, ap);
+                        return { content: [{ type: "text", text: "The cached CLSI build expired on Overleaf (404). Call `compile` again to produce a fresh log." }], isError: true };
+                    }
+                }
+                else {
+                    throw fetchErr;
+                }
+            }
             if (fullLog == null) {
                 return { content: [{ type: "text", text: "No output.log available." }], isError: true };
             }

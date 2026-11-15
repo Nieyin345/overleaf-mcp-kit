@@ -194,35 +194,12 @@ export class PdfPreviewService {
     }
 
     async compileAndPreview(ap, opts = {}) {
-        let compileResult = ap.lastCompile;
-        let compileSummary;
-        let errorLines = [];
-
-        if (!compileResult || opts.recompile !== false) {
-            const compiled = await compileService.compileProject(ap, {
-                root_doc: opts.root_doc,
-                draft: opts.draft,
-                stop_on_first_error: opts.stop_on_first_error,
-            });
-            compileResult = compiled.result;
-            compileSummary = compiled.summary;
-            errorLines = compiled.errorLines;
-        }
-        else {
-            compileSummary = compileResult._cachedSummary ?? {
-                status: compileResult.status ?? "unknown",
-                built_cleanly: true,
-                pdf_available: Boolean(compileResult.outputFiles?.some((f) => f.path === "output.pdf")),
-                error_count: 0,
-                warning_count: 0,
-                first_errors: [],
-                compile_time_ms: compileResult.timings?.compile,
-                output_files: (compileResult.outputFiles ?? []).map((f) => f.path),
-            };
-            errorLines = compileResult._cachedErrorLines ?? [];
-        }
-
-        const { buffer: pdfBuffer } = await compileService.fetchOutputBuffer(compileResult, "output.pdf");
+        const { buffer: pdfBuffer, compileSummary, errorLines } = await compileService.resolveAndFetchOutput(ap, "output.pdf", {
+            recompile: opts.recompile !== false,
+            root_doc: opts.root_doc,
+            draft: opts.draft,
+            stop_on_first_error: opts.stop_on_first_error,
+        });
         const rendered = await this.renderPdf(pdfBuffer, {
             pages: opts.pages,
             dpi: opts.dpi,

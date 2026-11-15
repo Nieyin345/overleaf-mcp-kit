@@ -169,9 +169,11 @@ function attachSocketTreeListeners(socket, projectId) {
             treeMutator.moveEntity(active, entityId, destFolderId);
     });
 }
-export function setLastCompile(result) {
+export function setLastCompile(result, ap = active) {
     if (active)
         active.lastCompile = result;
+    if (ap && ap !== active)
+        ap.lastCompile = result;
 }
 export function getActiveProject() {
     return active;

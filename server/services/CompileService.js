@@ -1,3 +1,4 @@
+import { OverleafApiError } from "../api/errors.js";
 import { asJson, expectOk, olGet, olGetBuffer, olPostJson } from "../api/http.js";
 import { setLastCompile } from "../session/activeProject.js";
 import { logger } from "../util/logger.js";
@@ -74,10 +75,12 @@ export class CompileService {
         let warningCount = 0;
         let errorLines = [];
         let logBytes = 0;
+        let cachedLog;
         if (logFile) {
             try {
                 const log = await this.fetchOutputText(result, "output.log");
-                if (log) {
+                if (typeof log === "string") {
+                    cachedLog = log;
                     logBytes = log.length;
                     const summarized = this.summarizeErrors(log);
                     errorLines = summarized.errors;
@@ -104,8 +107,71 @@ export class CompileService {
         };
         result._cachedSummary = summary;
         result._cachedErrorLines = errorLines;
+        result._cachedLog = cachedLog;
+        result._compiledAt = Date.now();
+        setLastCompile(result, ap);
         logger.info(`compile done project=${ap.projectId} status=${summary.status} errors=${errorCount} pdf=${summary.pdf_available}`);
         return { result, summary, errorLines };
+    }
+
+    getSummaryForCompile(compileResult) {
+        const pdfAvailable = Boolean(compileResult?.outputFiles?.some((f) => f.path === "output.pdf"));
+        return compileResult?._cachedSummary ?? {
+            status: compileResult?.status ?? "unknown",
+            built_cleanly: pdfAvailable,
+            pdf_available: pdfAvailable,
+            error_count: 0,
+            warning_count: 0,
+            first_errors: [],
+            compile_time_ms: compileResult?.timings?.compile,
+            output_files: (compileResult?.outputFiles ?? []).map((f) => f.path),
+        };
+    }
+
+    /**
+     * Resolves a compile result (fresh or cached) and fetches the requested build
+     * output. If a cached CLSI build has expired and returns HTTP 404, clears the
+     * stale cache, triggers one fresh compile, and retries automatically.
+     */
+    async resolveAndFetchOutput(ap, targetPath, opts = {}) {
+        const forceCompile = opts.recompile !== false;
+        const runFreshCompile = async () => {
+            const compiled = await this.compileProject(ap, {
+                root_doc: opts.root_doc,
+                draft: opts.draft,
+                stop_on_first_error: opts.stop_on_first_error,
+            });
+            const fetched = await this.fetchOutputBuffer(compiled.result, targetPath);
+            return {
+                ...fetched,
+                compileResult: compiled.result,
+                compileSummary: compiled.summary,
+                errorLines: compiled.errorLines,
+            };
+        };
+
+        if (forceCompile || !ap.lastCompile) {
+            return await runFreshCompile();
+        }
+
+        const cachedResult = ap.lastCompile;
+        try {
+            const fetched = await this.fetchOutputBuffer(cachedResult, targetPath);
+            return {
+                ...fetched,
+                compileResult: cachedResult,
+                compileSummary: this.getSummaryForCompile(cachedResult),
+                errorLines: cachedResult._cachedErrorLines ?? [],
+            };
+        }
+        catch (err) {
+            if (err instanceof OverleafApiError && err.status === 404) {
+                logger.warn(`cached compile build expired on CLSI (404 fetching '${targetPath}'); clearing stale cache and recompiling`);
+                setLastCompile(undefined, ap);
+                return await runFreshCompile();
+            }
+            throw err;
+        }
     }
 }
 

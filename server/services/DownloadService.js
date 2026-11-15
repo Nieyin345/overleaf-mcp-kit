@@ -88,19 +88,12 @@ export class DownloadService {
 
     async downloadCompileOutput(ap, opts = {}) {
         const artifactName = opts.output_file?.trim() || "output.pdf";
-        let compileResult = ap.lastCompile;
-        let compiledSummary = null;
+        const { buffer, compileResult, compileSummary } = await compileService.resolveAndFetchOutput(ap, artifactName, {
+            recompile: Boolean(opts.recompile),
+            root_doc: opts.root_doc,
+            draft: opts.draft,
+        });
 
-        if (!compileResult || opts.recompile) {
-            const compiled = await compileService.compileProject(ap, {
-                root_doc: opts.root_doc,
-                draft: opts.draft,
-            });
-            compileResult = compiled.result;
-            compiledSummary = compiled.summary;
-        }
-
-        const { buffer } = await compileService.fetchOutputBuffer(compileResult, artifactName);
         const stored = await artifactStore.putFile({
             projectId: ap.projectId,
             filename: artifactName.split("/").pop() || "output.pdf",
@@ -114,7 +107,7 @@ export class DownloadService {
         return {
             output_file: artifactName,
             available_outputs: (compileResult.outputFiles ?? []).map((f) => f.path),
-            compile_summary: compiledSummary,
+            compile_summary: compileSummary,
             ...stored,
             ...(includeBase64 ? { base64: buffer.toString("base64") } : {}),
         };

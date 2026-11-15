@@ -47,8 +47,8 @@ namespace OverleafMcp
                 ? exeDir
                 : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Overleaf-MCP");
 
-            string appDir = Path.Combine(dataDir, "app");
-            string versionFile = Path.Combine(appDir, ".bundle-version");
+            string appDir = Path.Combine(dataDir, "runtime-" + BundleVersion);
+            string readyMarker = Path.Combine(appDir, ".bundle-ready");
 
             try
             {
@@ -60,7 +60,7 @@ namespace OverleafMcp
                     File.WriteAllText(cfgPath, DefaultConfig, new UTF8Encoding(false));
                 }
 
-                bool needsExtract = !File.Exists(versionFile) || File.ReadAllText(versionFile, Encoding.UTF8).Trim() != BundleVersion;
+                bool needsExtract = !File.Exists(readyMarker);
                 if (needsExtract)
                 {
                     msgOut.WriteLine("=========================================");
@@ -68,11 +68,10 @@ namespace OverleafMcp
                     msgOut.WriteLine("  Target: " + appDir);
                     msgOut.WriteLine("=========================================");
 
-                    string tmpExtract = Path.Combine(dataDir, "app_extract_tmp");
-                    if (Directory.Exists(tmpExtract)) Directory.Delete(tmpExtract, true);
+                    string tmpExtract = Path.Combine(dataDir, "extract-" + BundleVersion + "-" + Guid.NewGuid().ToString("N").Substring(0, 8));
                     Directory.CreateDirectory(tmpExtract);
 
-                    string tmpZip = Path.Combine(dataDir, "payload_tmp.zip");
+                    string tmpZip = Path.Combine(dataDir, "payload-" + BundleVersion + ".zip");
                     using (Stream res = Assembly.GetExecutingAssembly().GetManifestResourceStream("payload.zip"))
                     {
                         if (res == null)
@@ -90,9 +89,20 @@ namespace OverleafMcp
                     ZipFile.ExtractToDirectory(tmpZip, tmpExtract);
                     File.Delete(tmpZip);
 
-                    if (Directory.Exists(appDir)) Directory.Delete(appDir, true);
-                    Directory.Move(tmpExtract, appDir);
-                    File.WriteAllText(versionFile, BundleVersion, new UTF8Encoding(false));
+                    if (Directory.Exists(appDir))
+                    {
+                        try { Directory.Delete(appDir, true); } catch { }
+                    }
+                    if (!Directory.Exists(appDir))
+                    {
+                        Directory.Move(tmpExtract, appDir);
+                    }
+                    else
+                    {
+                        try { Directory.Delete(tmpExtract, true); } catch { }
+                    }
+                    File.WriteAllText(readyMarker, BundleVersion, new UTF8Encoding(false));
+                    CleanupOldRuntimes(dataDir, appDir);
                     msgOut.WriteLine("[OK] Runtime ready.");
                     msgOut.WriteLine();
                 }
@@ -118,6 +128,23 @@ namespace OverleafMcp
                 if (!stdioOrCli) JobRunner.PauseIfError(1);
                 return 1;
             }
+        }
+        private static void CleanupOldRuntimes(string dataDir, string currentAppDir)
+        {
+            try
+            {
+                string currentName = Path.GetFileName(currentAppDir);
+                foreach (string dir in Directory.GetDirectories(dataDir))
+                {
+                    string name = Path.GetFileName(dir);
+                    if (name == currentName) continue;
+                    if (name == "app" || name.StartsWith("runtime-") || name.StartsWith("extract-") || name == "app_extract_tmp")
+                    {
+                        try { Directory.Delete(dir, true); } catch { /* in use by older instance */ }
+                    }
+                }
+            }
+            catch { }
         }
     }
 }

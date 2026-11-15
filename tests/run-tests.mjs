@@ -67,9 +67,10 @@ async function testMcpStdioTools() {
     const list = await client.listTools();
     const names = new Set(list.tools.map((t) => t.name));
     const expected = [
-        "ping", "auth_status", "list_projects", "open_project", "list_files", "read_file",
+        "ping", "auth_status", "list_projects", "open_project", "list_files", "read_file", "read_files",
         "edit_file", "find_and_replace", "multi_replace", "search_in_project", "compile", "read_log",
-        "list_comments", "read_comment_thread", "add_comment", "reply_comment", "resolve_comment", "reopen_comment",
+        "list_comments", "read_comment_thread", "add_comment", "batch_add_comments",
+        "reply_comment", "batch_reply_comments", "resolve_comment", "reopen_comment", "batch_resolve_comments",
         "list_tracked_changes", "accept_changes", "reject_changes",
         "create_folder", "create_doc", "upload_file", "delete_entity", "rename_entity", "move_entity",
         "download_file", "download_project", "download_output", "preview_pdf",
@@ -286,7 +287,13 @@ async function testMockOverleafWorkflow() {
     const fileContents = new Map();
     let seq = 100;
     let compileHits = 0;
+    let buildSeq = 0;
+    const expiredBuilds = new Set();
     let dropDocHits = 0;
+    let wsUpgrades = 0;
+    let rangesHits = 0;
+    const commentThreads = new Map();
+    const commentAnchors = new Map(); // docId -> array of { op: { p, c, t } }
     const events = [];
 
     const server = http.createServer(async (req, res) => {
@@ -470,6 +477,8 @@ async function testMockOverleafWorkflow() {
                 assert.ok(body.rootResourcePath.length > 0);
             }
             assert.equal(body.rootResourcePath, "main.tex", "compile without root_doc should default to active rootDocPath");
+            buildSeq++;
+            const bid = `b${buildSeq}`;
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({
                 status: "success",
@@ -477,29 +486,78 @@ async function testMockOverleafWorkflow() {
                 compileGroup: "grp-1",
                 timings: { compile: 120, compileE2E: 150 },
                 outputFiles: [
-                    { path: "output.pdf", url: "/project/proj000001/output/output.pdf", type: "pdf" },
-                    { path: "output.log", url: "/project/proj000001/output/output.log", type: "log" },
+                    { path: "output.pdf", url: `/project/proj000001/build/${bid}/output/output.pdf`, type: "pdf", build: bid },
+                    { path: "output.log", url: `/project/proj000001/build/${bid}/output/output.log`, type: "log", build: bid },
                 ],
             }));
             return;
         }
-        if (req.method === "GET" && p === "/project/proj000001/output/output.log") {
-            res.writeHead(200, { "Content-Type": "text/plain" });
-            res.end("This is pdfTeX\nOutput written on output.pdf (1 page).\n");
-            return;
-        }
-        if (req.method === "GET" && p === "/project/proj000001/output/output.pdf") {
+        const buildOutMatch = p.match(/^\/project\/proj000001\/build\/([^/]+)\/output\/(output\.(?:log|pdf))$/);
+        if (req.method === "GET" && buildOutMatch) {
+            const [, bid, fileName] = buildOutMatch;
+            if (expiredBuilds.has(bid)) {
+                res.writeHead(404, { "Content-Type": "text/plain" });
+                res.end("Not Found (expired build)");
+                return;
+            }
+            if (fileName === "output.log") {
+                res.writeHead(200, { "Content-Type": "text/plain" });
+                res.end("This is pdfTeX\nOutput written on output.pdf (1 page).\n");
+                return;
+            }
             assert.equal(url.searchParams.get("clsiserverid"), "clsi-1");
             res.writeHead(200, { "Content-Type": "application/pdf" });
             res.end(pdfBuf);
             return;
         }
-        if (req.method === "POST" && /^\/project\/proj000001\/doc\/[^/]+\/thread\/[^/]+\/messages$/.test(p)) {
-            const threadId = p.split("/")[6];
+        if (req.method === "GET" && p === "/project/proj000001/threads") {
+            const obj = {};
+            for (const [tid, t] of commentThreads) obj[tid] = t;
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(obj));
+            return;
+        }
+        if (req.method === "GET" && p === "/project/proj000001/ranges") {
+            rangesHits++;
+            const arr = [];
+            for (const [docId, comments] of commentAnchors) {
+                arr.push({ id: docId, ranges: { comments, changes: [] } });
+            }
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(arr));
+            return;
+        }
+        if (req.method === "POST" && /^\/project\/proj000001\/(?:doc\/[^/]+\/)?thread\/([^/]+)\/messages$/.test(p)) {
+            const threadId = p.split("/").slice(-2)[0];
             const body = JSON.parse(rawBody.toString("utf8"));
+            let entry = commentThreads.get(threadId);
+            if (!entry) {
+                entry = { resolved: false, messages: [] };
+                commentThreads.set(threadId, entry);
+            }
+            entry.messages.push({
+                user: { first_name: "AI", last_name: "Reviewer", email: "ai@test.local" },
+                timestamp: Date.now(),
+                content: body.content,
+            });
             events.push(`comment:${threadId}:${body.content.length}`);
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: true }));
+            return;
+        }
+        if (req.method === "POST" && /^\/project\/proj000001\/doc\/[^/]+\/thread\/([^/]+)\/(resolve|reopen)$/.test(p)) {
+            const parts = p.split("/");
+            const action = parts[parts.length - 1];
+            const threadId = parts[parts.length - 2];
+            const entry = commentThreads.get(threadId);
+            if (!entry) {
+                res.writeHead(404);
+                res.end("Thread not found");
+                return;
+            }
+            entry.resolved = action === "resolve";
+            res.writeHead(204);
+            res.end();
             return;
         }
         if (req.method === "GET" && p.startsWith("/project/proj000001/file/")) {
@@ -514,8 +572,16 @@ async function testMockOverleafWorkflow() {
 
     const wss = new WebSocketServer({ noServer: true });
     server.on("upgrade", (req, socket, head) => {
+        wsUpgrades++;
         wss.handleUpgrade(req, socket, head, (ws) => {
             ws.send("1::");
+            if (wsUpgrades === 1) {
+                // Simulate Overleaf sending disconnect frame `0::` immediately on first connect;
+                // ensureSocketForProject must fast-fail (no 3s stall) and recover on attempt 2.
+                ws.send("0::");
+                setTimeout(() => ws.terminate(), 10);
+                return;
+            }
             ws.send(`5:::{"name":"joinProjectResponse","args":[{"project":{"_id":"proj000001","name":"MockPaper","rootDoc_id":"doc00001","rootFolder":[${JSON.stringify(rootFolder)}]},"permissionsLevel":"owner","protocolVersion":2}]}`);
             ws.on("message", (msg) => {
                 const s = msg.toString("utf8");
@@ -544,6 +610,11 @@ async function testMockOverleafWorkflow() {
                         }
                         else if (op.d !== undefined) {
                             text = text.slice(0, op.p) + text.slice(op.p + op.d.length);
+                        }
+                        else if (op.t && op.c) {
+                            const arr = commentAnchors.get(docId) ?? [];
+                            arr.push({ op });
+                            commentAnchors.set(docId, arr);
                         }
                     }
                     docContents.set(docId, text);
@@ -579,9 +650,10 @@ async function testMockOverleafWorkflow() {
         assert.ok(!authRes.isError, authRes.content[0].text);
         assert.match(authRes.content[0].text, /ai@test\.local/);
 
-        // Open project
+        // Open project (first WS attempt simulates immediate `0::` disconnect frame; must recover cleanly)
         const openRes = await client.callTool({ name: "open_project", arguments: { project_id: "proj000001" } });
         assert.ok(!openRes.isError, openRes.content[0].text);
+        assert.equal(wsUpgrades, 2, "open_project should auto-retry after immediate server disconnect frame");
 
         // Upload binary image into nested folder
         const upRes = await client.callTool({
@@ -646,6 +718,70 @@ async function testMockOverleafWorkflow() {
         });
         assert.ok(!cmtRes.isError, cmtRes.content[0].text);
         assert.match(cmtRes.content[0].text, /Added comment thread/);
+
+        // Batch read multiple files in one call (including one missing file for per-item error isolation)
+        const readBatchRes = await client.callTool({
+            name: "read_files",
+            arguments: { paths: ["main.tex", "chapters/intro_v2.tex", "does_not_exist.tex"] },
+        });
+        assert.ok(!readBatchRes.isError, readBatchRes.content[0].text);
+        assert.equal(readBatchRes.structuredContent.succeeded, 2);
+        assert.equal(readBatchRes.structuredContent.failed, 1);
+
+        // Batch add multiple comments across docs (plus 1 missing quote) in one call
+        const batchAddRes = await client.callTool({
+            name: "batch_add_comments",
+            arguments: {
+                comments: [
+                    { path: "main.tex", quote: "\\documentclass{article}", content: "Comment on documentclass." },
+                    { path: "chapters/intro_v2.tex", quote: "\\section{Introduction}", content: "Comment on section header." },
+                    { path: "chapters/intro_v2.tex", quote: "NONEXISTENT_QUOTE", content: "Should fail gracefully." },
+                ],
+            },
+        });
+        assert.ok(!batchAddRes.isError, batchAddRes.content[0].text);
+        assert.equal(batchAddRes.structuredContent.succeeded, 2);
+        assert.equal(batchAddRes.structuredContent.failed, 1);
+
+        // list_comments(full: true) returns full message arrays without calling read_comment_thread
+        const listFullRes = await client.callTool({
+            name: "list_comments",
+            arguments: { full: true },
+        });
+        assert.ok(!listFullRes.isError, listFullRes.content[0].text);
+        assert.equal(listFullRes.structuredContent.count, 3);
+        assert.ok(listFullRes.structuredContent.threads.every((t) => Array.isArray(t.messages) && t.messages.length >= 1));
+
+        // Batch reply + resolve multiple threads in one call (verifies single /ranges lookup)
+        const createdThreadIds = batchAddRes.structuredContent.results.filter((r) => r.ok).map((r) => r.thread_id);
+        const rangesBeforeBatch = rangesHits;
+        const batchReplyRes = await client.callTool({
+            name: "batch_reply_comments",
+            arguments: {
+                replies: createdThreadIds.map((tid, idx) => ({
+                    thread_id: tid,
+                    content: `Batch reply #${idx + 1}`,
+                    resolve: true,
+                })),
+            },
+        });
+        assert.ok(!batchReplyRes.isError, batchReplyRes.content[0].text);
+        assert.equal(batchReplyRes.structuredContent.succeeded, 2);
+        assert.equal(rangesHits, rangesBeforeBatch + 1, "batch_reply_comments should fetch /ranges only once");
+
+        // Batch reopen and re-resolve multiple threads
+        const batchReopenRes = await client.callTool({
+            name: "batch_resolve_comments",
+            arguments: { thread_ids: createdThreadIds, action: "reopen" },
+        });
+        assert.ok(!batchReopenRes.isError, batchReopenRes.content[0].text);
+        assert.equal(batchReopenRes.structuredContent.succeeded, 2);
+        const batchResolveRes = await client.callTool({
+            name: "batch_resolve_comments",
+            arguments: { thread_ids: createdThreadIds, action: "resolve" },
+        });
+        assert.ok(!batchResolveRes.isError, batchResolveRes.content[0].text);
+        assert.equal(batchResolveRes.structuredContent.succeeded, 2);
 
         // Protect root doc deletion
         const delRoot = await client.callTool({ name: "delete_entity", arguments: { path: "main.tex" } });
@@ -716,6 +852,25 @@ async function testMockOverleafWorkflow() {
         const outRes = await client.callTool({ name: "download_output", arguments: { output_file: "output.pdf" } });
         assert.ok(!outRes.isError, outRes.content[0].text);
         assert.match(outRes.content[0].text, /output\.pdf/);
+
+        // Simulate CLSI build eviction (404 on cached buildId) -> preview_pdf(recompile=false), read_log, and download_output must auto-recover
+        const hitsBeforeExpiry = compileHits;
+        expiredBuilds.add(`b${buildSeq}`);
+        const expiredPrevRes = await client.callTool({
+            name: "preview_pdf",
+            arguments: { pages: "1", dpi: 100, recompile: false },
+        });
+        assert.ok(!expiredPrevRes.isError, expiredPrevRes.content[0].text);
+        assert.equal(compileHits, hitsBeforeExpiry + 1, "preview_pdf(recompile=false) should recompile automatically when cached build returns 404");
+
+        expiredBuilds.add(`b${buildSeq}`);
+        const cachedLogRes = await client.callTool({ name: "read_log", arguments: {} });
+        assert.ok(!cachedLogRes.isError, cachedLogRes.content[0].text);
+        assert.match(cachedLogRes.content[0].text, /Output written on output\.pdf/);
+
+        const expiredOutRes = await client.callTool({ name: "download_output", arguments: { output_file: "output.pdf" } });
+        assert.ok(!expiredOutRes.isError, expiredOutRes.content[0].text);
+        assert.equal(compileHits, hitsBeforeExpiry + 2, "download_output should recompile automatically when cached build returns 404");
 
         console.log("[PASS] Full mock Overleaf workflow succeeded (events:", events.join(", "), ")");
     }

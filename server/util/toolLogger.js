@@ -36,6 +36,7 @@ const TOOL_CATEGORY_MAP = {
     open_project: "browse",
     list_files: "browse",
     read_file: "browse",
+    read_files: "browse",
     search_in_project: "search",
     edit_file: "edit",
     find_and_replace: "edit",
@@ -58,9 +59,12 @@ const TOOL_CATEGORY_MAP = {
     list_comments: "comment",
     read_comment_thread: "comment",
     add_comment: "comment",
+    batch_add_comments: "comment",
     reply_comment: "comment",
+    batch_reply_comments: "comment",
     resolve_comment: "comment",
     reopen_comment: "comment",
+    batch_resolve_comments: "comment",
 };
 
 function nowTime() {

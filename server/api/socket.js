@@ -33,6 +33,8 @@ class OverleafSocket {
     heartbeatInterval = 60_000;
     heartbeatTimer = null;
     closed = false;
+    serverDisconnected = false;
+    onConnectDisconnect = null;
     joinedProject = null;
     publicId = null;
     permissionsLevel = null;
@@ -41,17 +43,27 @@ class OverleafSocket {
         this.projectId = projectId;
         this.identity = identity;
     }
-    async connect(timeoutMs = 15_000) {
+    static stripGclbCookie(cookieHeader) {
+        return String(cookieHeader || "")
+            .split(";")
+            .map((p) => p.trim())
+            .filter((p) => p && !/^GCLB=/i.test(p))
+            .join("; ");
+    }
+    async connect(timeoutMs = 15_000, opts = {}) {
         const base = this.identity.baseUrl;
         const t = Date.now();
         const hsUrl = `${base}/socket.io/1/?projectId=${encodeURIComponent(this.projectId)}&t=${t}`;
+        const hsCookie = opts.freshRoute
+            ? OverleafSocket.stripGclbCookie(this.identity.cookie)
+            : this.identity.cookie;
         const hsRes = await fetch(hsUrl, {
             method: "GET",
             redirect: "manual",
             headers: {
-                Cookie: this.identity.cookie,
+                Cookie: hsCookie,
                 Origin: new URL(base).origin,
-                Connection: "keep-alive",
+                Connection: opts.freshRoute ? "close" : "keep-alive",
             },
         });
         if (hsRes.status >= 300 && hsRes.status < 400) {
@@ -77,7 +89,7 @@ class OverleafSocket {
         // so we extract any Set-Cookie from the handshake and merge it into the
         // Cookie header we send on the upgrade. Without this the upgrade routes
         // randomly and intermittently returns 502.
-        const upgradeCookie = mergeSetCookies(this.identity.cookie, hsRes.headers);
+        const upgradeCookie = mergeSetCookies(hsCookie, hsRes.headers);
         void applyResponseCookies(base, this.identity.cookie, hsRes.headers);
         const wsUrl = `${base.replace(/^http/, "ws")}/socket.io/1/websocket/${sid}`;
         const ws = new WebSocket(wsUrl, {
@@ -85,28 +97,61 @@ class OverleafSocket {
             handshakeTimeout: timeoutMs,
         });
         this.ws = ws;
-        await new Promise((resolve, reject) => {
-            const settleTimer = setTimeout(() => reject(new OverleafApiError(0, "", `WebSocket upgrade did not complete within ${timeoutMs}ms`)), timeoutMs);
-            ws.once("open", () => {
-                clearTimeout(settleTimer);
-                logger.info(`socket.io connected (sid=${sid})`);
-                this.startHeartbeats();
-                // joinProjectResponse arrives auto-magically on v2-style URL.
-                const once = (args) => {
-                    const payload = args[0];
-                    if (payload) {
-                        this.joinedProject = payload.project ?? null;
-                        this.publicId = payload.publicId ?? null;
-                        this.permissionsLevel = payload.permissionsLevel ?? null;
-                        this.protocolVersion = payload.protocolVersion ?? null;
+        try {
+            await new Promise((resolve, reject) => {
+                let settled = false;
+                let fallbackTimer = null;
+                const settleTimer = setTimeout(() => {
+                    failConnect(new OverleafApiError(0, "", `WebSocket joinProject did not complete within ${timeoutMs}ms`));
+                }, timeoutMs);
+                const cleanupTimers = () => {
+                    clearTimeout(settleTimer);
+                    if (fallbackTimer) {
+                        clearTimeout(fallbackTimer);
+                        fallbackTimer = null;
                     }
+                    this.onConnectDisconnect = null;
+                };
+                const finishConnect = () => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    cleanupTimers();
                     resolve();
                 };
-                this.once("joinProjectResponse", once);
-                // Some servers (older / v1 path) won't emit joinProjectResponse on the
-                // initial WS connect; fall back to emitting joinProject explicitly.
-                setTimeout(() => {
-                    if (!this.joinedProject) {
+                const failConnect = (err) => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    cleanupTimers();
+                    reject(err instanceof Error ? err : new Error(String(err)));
+                };
+                this.onConnectDisconnect = () => {
+                    failConnect(new OverleafApiError(0, "", "server sent disconnect frame during connect"));
+                };
+                ws.once("open", () => {
+                    if (settled || this.closed)
+                        return;
+                    logger.info(`socket.io connected (sid=${sid})`);
+                    this.startHeartbeats();
+                    // joinProjectResponse arrives auto-magically on v2-style URL.
+                    const once = (args) => {
+                        const payload = args[0];
+                        if (payload) {
+                            this.joinedProject = payload.project ?? null;
+                            this.publicId = payload.publicId ?? null;
+                            this.permissionsLevel = payload.permissionsLevel ?? null;
+                            this.protocolVersion = payload.protocolVersion ?? null;
+                        }
+                        finishConnect();
+                    };
+                    this.once("joinProjectResponse", once);
+                    // Some servers (older / v1 path) won't emit joinProjectResponse on the
+                    // initial WS connect; fall back to emitting joinProject explicitly.
+                    fallbackTimer = setTimeout(() => {
+                        fallbackTimer = null;
+                        if (settled || this.joinedProject || !this.isOpen())
+                            return;
                         logger.info("no joinProjectResponse received, falling back to explicit joinProject emit");
                         this.emit("joinProject", [{ project_id: this.projectId }])
                             .then((ret) => {
@@ -115,29 +160,38 @@ class OverleafSocket {
                             this.joinedProject = project ?? null;
                             this.permissionsLevel = perm ?? null;
                             this.protocolVersion = typeof proto === "number" ? proto : null;
-                            resolve();
+                            finishConnect();
                         })
-                            .catch(reject);
+                            .catch(failConnect);
+                    }, 3_000);
+                });
+                ws.once("error", (err) => {
+                    failConnect(err instanceof Error ? err : new Error(String(err)));
+                });
+                ws.on("message", (data) => this.handleFrame(data.toString("utf8")));
+                ws.once("close", (code, reason) => {
+                    this.stopHeartbeats();
+                    this.closed = true;
+                    const r = reason?.toString?.() ?? "";
+                    logger.warn(`socket closed code=${code} reason=${r}`);
+                    for (const [, p] of this.pending) {
+                        clearTimeout(p.timer);
+                        p.reject(new Error(`socket closed (${code}) ${r}`));
                     }
-                }, 3_000);
+                    this.pending.clear();
+                    if (!settled) {
+                        const msg = this.serverDisconnected
+                            ? "server sent disconnect frame during connect"
+                            : `socket closed during connect (${code}) ${r}`.trim();
+                        failConnect(new OverleafApiError(0, "", msg));
+                    }
+                });
             });
-            ws.once("error", (err) => {
-                clearTimeout(settleTimer);
-                reject(err instanceof Error ? err : new Error(String(err)));
-            });
-            ws.on("message", (data) => this.handleFrame(data.toString("utf8")));
-            ws.once("close", (code, reason) => {
-                this.stopHeartbeats();
-                this.closed = true;
-                const r = reason?.toString?.() ?? "";
-                logger.warn(`socket closed code=${code} reason=${r}`);
-                for (const [, p] of this.pending) {
-                    clearTimeout(p.timer);
-                    p.reject(new Error(`socket closed (${code}) ${r}`));
-                }
-                this.pending.clear();
-            });
-        });
+        }
+        catch (err) {
+            this.disconnect();
+            throw err;
+        }
     }
     startHeartbeats() {
         this.heartbeatTimer = setInterval(() => {
@@ -170,10 +224,12 @@ class OverleafSocket {
         switch (type) {
             case "0": // disconnect
                 logger.warn("server sent disconnect frame");
+                this.serverDisconnected = true;
                 try {
                     this.ws?.close();
                 }
                 catch { /* ignore */ }
+                this.onConnectDisconnect?.();
                 return;
             case "1": // connect ack — usually with empty endpoint
                 return;
@@ -328,8 +384,24 @@ class OverleafSocket {
     }
 }
 let active = null;
+const connectInFlight = new Map();
+
+function isTransientConnectError(err) {
+    if (!err || err instanceof OverleafAuthError)
+        return false;
+    const msg = err instanceof Error ? err.message : String(err);
+    return /server sent disconnect frame|socket closed|socket not open|did not complete within|Unexpected server response: 50[234]|ECONNRESET|ETIMEDOUT|fetch failed|UND_ERR_/i.test(msg);
+}
+
 export async function ensureSocketForProject(projectId) {
-    return withAuthRetry(async () => {
+    if (active && active.projectId === projectId && active.isOpen()) {
+        return { socket: active, publicId: active.publicId ?? undefined, joinedProject: active.joinedProject ?? undefined };
+    }
+    const existingFlight = connectInFlight.get(projectId);
+    if (existingFlight) {
+        return await existingFlight;
+    }
+    const flight = withAuthRetry(async () => {
         if (active && active.projectId === projectId && active.isOpen()) {
             return { socket: active, publicId: active.publicId ?? undefined, joinedProject: active.joinedProject ?? undefined };
         }
@@ -339,11 +411,34 @@ export async function ensureSocketForProject(projectId) {
             active = null;
         }
         const identity = await getIdentity();
-        const s = new OverleafSocket(projectId, identity);
-        await s.connect();
-        active = s;
-        return { socket: s, publicId: s.publicId ?? undefined, joinedProject: s.joinedProject ?? undefined };
+        const maxAttempts = 3;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            const s = new OverleafSocket(projectId, identity);
+            try {
+                await s.connect(15_000, { freshRoute: attempt > 1 });
+                active = s;
+                return { socket: s, publicId: s.publicId ?? undefined, joinedProject: s.joinedProject ?? undefined };
+            }
+            catch (err) {
+                if (attempt < maxAttempts && isTransientConnectError(err)) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    const jitter = Math.floor(Math.random() * 180);
+                    const delayMs = (attempt === 1 ? 400 : 1000) + jitter;
+                    logger.warn(`socket connect attempt ${attempt}/${maxAttempts} failed (${msg}); retrying in ${delayMs}ms with fresh route`);
+                    await new Promise((r) => setTimeout(r, delayMs));
+                    continue;
+                }
+                throw err;
+            }
+        }
     });
+    connectInFlight.set(projectId, flight);
+    try {
+        return await flight;
+    }
+    finally {
+        connectInFlight.delete(projectId);
+    }
 }
 export function getActiveSocket() {
     return active;
