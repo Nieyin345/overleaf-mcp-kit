@@ -285,6 +285,8 @@ async function testMockOverleafWorkflow() {
     const docVersions = new Map([["doc00001", 1]]);
     const fileContents = new Map();
     let seq = 100;
+    let compileHits = 0;
+    let dropDocHits = 0;
     const events = [];
 
     const server = http.createServer(async (req, res) => {
@@ -327,6 +329,11 @@ async function testMockOverleafWorkflow() {
         }
         if (req.method === "POST" && p === "/project/proj000001/doc") {
             const body = JSON.parse(rawBody.toString("utf8"));
+            if (body.name === "drop_once_nonidempotent.tex") {
+                dropDocHits++;
+                req.socket.destroy();
+                return;
+            }
             const id = `doc${++seq}`;
             const findFolder = (f) => {
                 if (f._id === body.parent_folder_id) return f;
@@ -450,6 +457,12 @@ async function testMockOverleafWorkflow() {
             return;
         }
         if (req.method === "POST" && p === "/project/proj000001/compile") {
+            compileHits++;
+            if (compileHits === 1) {
+                // Simulate first-compile idle keep-alive socket reset; idempotent compile must recover automatically
+                req.socket.destroy();
+                return;
+            }
             const body = JSON.parse(rawBody.toString("utf8"));
             assert.notEqual(body.rootResourcePath, null, "compile must never send rootResourcePath: null (Overleaf Zod rejects null with HTTP 400)");
             if (body.rootResourcePath !== undefined) {
@@ -672,10 +685,17 @@ async function testMockOverleafWorkflow() {
         const delRecursiveOk = await client.callTool({ name: "delete_entity", arguments: { path: "chapters", recursive: true } });
         assert.ok(!delRecursiveOk.isError, delRecursiveOk.content[0].text);
 
-        // Compile directly WITHOUT root_doc (must not send rootResourcePath: null)
+        // Non-idempotent create_doc must NOT auto-retry on socket reset (prevents duplicate creation)
+        const dropDocRes = await client.callTool({ name: "create_doc", arguments: { path: "drop_once_nonidempotent.tex" } });
+        assert.ok(dropDocRes.isError, "Non-idempotent create_doc should surface network error instead of blind retry");
+        assert.equal(dropDocHits, 1, "Non-idempotent create_doc must attempt only once");
+        assert.match(dropDocRes.content[0].text, /HTTP POST project\/proj000001\/doc failed: fetch failed/);
+
+        // Compile directly WITHOUT root_doc (first socket drops -> auto-retries once -> succeeds, must not send rootResourcePath: null)
         const cmpRes = await client.callTool({ name: "compile", arguments: {} });
         assert.ok(!cmpRes.isError, cmpRes.content[0].text);
         assert.match(cmpRes.content[0].text, /Built cleanly/);
+        assert.equal(compileHits, 2, "Idempotent compile should auto-retry once on transient socket drop");
 
         // Download project zip
         const zipRes = await client.callTool({ name: "download_project", arguments: {} });

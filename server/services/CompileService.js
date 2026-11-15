@@ -64,7 +64,7 @@ export class CompileService {
             ...(resolvedRootDoc ? { rootResourcePath: resolvedRootDoc } : {}),
         };
         logger.info(`compile start project=${ap.projectId} draft=${body.draft} root_doc=${resolvedRootDoc ?? "(server-default)"}`);
-        const res = await olPostJson(`project/${ap.projectId}/compile?auto_compile=true`, body);
+        const res = await olPostJson(`project/${ap.projectId}/compile?auto_compile=true`, body, {}, { idempotent: true });
         const result = await asJson(res, `POST project/${ap.projectId}/compile`);
         setLastCompile(result);
 
