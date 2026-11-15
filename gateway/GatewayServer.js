@@ -129,6 +129,77 @@ export class GatewayServer {
         this.server = null;
     }
 
+    static formatTimestamp() {
+        const d = new Date();
+        return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+    }
+
+    static logHttp(method, reqPath, status, ms) {
+        const ts = GatewayServer.formatTimestamp();
+        const badge = status >= 400 ? "\x1b[31m⚠️" : "\x1b[90m🌐";
+        console.log(`\x1b[90m${ts}\x1b[0m ${badge} [HTTP] ${method} ${reqPath} → ${status} (${ms}ms)\x1b[0m`);
+    }
+
+    /**
+     * Handles HTTP probe methods that mcp-proxy omits (`HEAD /mcp`, `GET /mcp`
+     * without session ID -> 405 per MCP Streamable HTTP spec, and `/healthz`).
+     */
+    handleMcpProbe(req, res) {
+        const method = req.method || "GET";
+        const parsed = new URL(req.url || "/", "http://localhost");
+        const pathname = parsed.pathname;
+
+        const corsHeaders = {
+            "Access-Control-Allow-Origin": req.headers.origin || "*",
+            "Access-Control-Allow-Methods": "GET, POST, HEAD, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key, Mcp-Session-Id, Last-Event-ID, MCP-Protocol-Version",
+            "Access-Control-Expose-Headers": "Mcp-Session-Id, MCP-Protocol-Version",
+        };
+
+        if (method === "HEAD" && (pathname === "/mcp" || pathname === "/sse" || pathname === "/" || pathname === "/healthz")) {
+            res.writeHead(200, {
+                "Content-Type": "application/json; charset=utf-8",
+                "MCP-Protocol-Version": "2025-06-18",
+                "Allow": "GET, POST, HEAD, DELETE, OPTIONS",
+                ...corsHeaders,
+            });
+            res.end();
+            GatewayServer.logHttp(method, req.url || pathname, 200, 0);
+            return true;
+        }
+
+        if (method === "GET" && (pathname === "/" || pathname === "/healthz")) {
+            const body = JSON.stringify({ ok: true, service: "overleaf-mcp", endpoints: ["/mcp", "/sse"] });
+            res.writeHead(200, {
+                "Content-Type": "application/json; charset=utf-8",
+                "MCP-Protocol-Version": "2025-06-18",
+                ...corsHeaders,
+            });
+            res.end(body);
+            GatewayServer.logHttp(method, req.url || pathname, 200, 0);
+            return true;
+        }
+
+        if (method === "GET" && pathname === "/mcp" && !req.headers["mcp-session-id"]) {
+            const body = JSON.stringify({
+                jsonrpc: "2.0",
+                error: { code: -32000, message: "Method Not Allowed: establish a session via POST /mcp first." },
+                id: null,
+            });
+            res.writeHead(405, {
+                "Allow": "POST, HEAD, DELETE, OPTIONS",
+                "Content-Type": "application/json; charset=utf-8",
+                "MCP-Protocol-Version": "2025-06-18",
+                ...corsHeaders,
+            });
+            res.end(body);
+            GatewayServer.logHttp(method, req.url || pathname, 405, 0);
+            return true;
+        }
+
+        return false;
+    }
+
     async start() {
         this.server = http.createServer(async (req, res) => {
             try {
@@ -143,6 +214,8 @@ export class GatewayServer {
                 }
                 return;
             }
+            if (this.handleMcpProbe(req, res))
+                return;
             this.proxyHttp(req, res);
         });
 
@@ -182,10 +255,7 @@ export class GatewayServer {
         }, (proxyRes) => {
             const status = proxyRes.statusCode ?? 502;
             const ms = Date.now() - startedAt;
-            const d = new Date();
-            const ts = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
-            const badge = status >= 400 ? "\x1b[31m⚠️" : "\x1b[90m🌐";
-            console.log(`\x1b[90m${ts}\x1b[0m ${badge} [HTTP] ${method} ${reqPath} → ${status} (${ms}ms)\x1b[0m`);
+            GatewayServer.logHttp(method, reqPath, status, ms);
             res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
             proxyRes.pipe(res);
         });

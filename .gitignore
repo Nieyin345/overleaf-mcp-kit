@@ -6,6 +6,7 @@ auto-apikey.txt
 artifacts/
 downloads/
 dist/
+dist-*/
 node/
 node_modules/
 bin/

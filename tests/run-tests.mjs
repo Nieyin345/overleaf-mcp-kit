@@ -172,6 +172,15 @@ async function testGatewayAndArtifacts() {
         }
         assert.ok(initialized, "mcp-proxy failed to initialize through GatewayServer");
 
+        // Test MCP HTTP probe endpoints (HEAD /mcp -> 200, GET /mcp w/o session -> 405, /healthz -> 200)
+        const headMcp = await fetch(`http://127.0.0.1:${publicPort}/mcp`, { method: "HEAD" });
+        assert.equal(headMcp.status, 200, "HEAD /mcp should return 200 for Web AI health probes");
+        assert.ok(headMcp.headers.get("mcp-protocol-version"));
+        const getMcpNoSid = await fetch(`http://127.0.0.1:${publicPort}/mcp`, { method: "GET" });
+        assert.equal(getMcpNoSid.status, 405, "GET /mcp without Mcp-Session-Id should return 405");
+        const hzRes = await fetch(`http://127.0.0.1:${publicPort}/healthz`);
+        assert.equal(hzRes.status, 200);
+
         // Test preview HTML & PDF download
         const prevRes = await fetch(`http://127.0.0.1:${publicPort}/preview/${bundle.token}`);
         assert.equal(prevRes.status, 200);

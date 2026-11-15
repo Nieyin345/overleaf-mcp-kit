@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const kitRoot = path.resolve(here, "..");
-const distDir = path.join(kitRoot, "dist");
+const distDir = process.env.OL_DIST_DIR ? path.resolve(kitRoot, process.env.OL_DIST_DIR) : path.join(kitRoot, "dist");
 const portableDir = path.join(distDir, "Overleaf-MCP-Portable");
 const payloadStageDir = path.join(distDir, "_payload_stage");
 
